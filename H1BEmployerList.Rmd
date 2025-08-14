@@ -1,0 +1,160 @@
+---
+title: "H-1B Employer/LCA Link"
+author: "Drew Greene"
+date: "2025-08-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readr)
+library(writexl)
+library(stringr)
+```
+
+
+Load and prepare data
+```{r}
+lca <- read_csv("LCA_Disclosure_Data_FY2025_Q2.csv")
+employers <- read_csv("Employer_Information.csv")
+```
+
+Merge the datasets
+```{r}
+# Create join keys
+lca <- lca |>
+  mutate(FEIN_last4 = str_sub(EMPLOYER_FEIN, -4),
+         EMPLOYER_POSTAL_CODE = str_trim(EMPLOYER_POSTAL_CODE))
+
+# Join all approval columns and merge non-distinct case numbers
+approval_cols <- c("New_Employment_Approval", "New_Employment_Denial",
+                   "Continuation_Approval", "Continuation_Denial",
+                   "Change_with_Same_Employer_Approval", "Change_with_Same_Employer_Denial",
+                   "New_Concurrent_Approval", "New_Concurrent_Denial",
+                   "Change_of_Employer_Approval", "Change_of_Employer_Denial",
+                   "Amended_Approval", "Amended_Denial")
+
+employers <- employers |> 
+  mutate(
+    Tax_ID = str_pad(as.character(Tax_ID), 4, pad = "0"),
+    Petitioner_ZipCode = str_trim(Petitioner_ZipCode)
+  ) |> 
+  group_by(Tax_ID, Petitioner_ZipCode) |> 
+  summarize(across(all_of(approval_cols), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+
+# Join many LCAs to one employer summary
+merged <- lca |> 
+  inner_join(employers, by = c("FEIN_last4" = "Tax_ID", "EMPLOYER_POSTAL_CODE" = "Petitioner_ZipCode"))
+
+```
+
+Summary Statistics
+```{r}
+# Total number of matched employers
+n_distinct(merged$EMPLOYER_NAME)
+
+# Number of selected petitions
+table(merged$Case_Status)
+
+# Job area overview
+merged |> 
+  count(JOB_TITLE, sort = TRUE) |>
+  head(10)
+```
+
+Wage Level Breakdown
+```{r}
+merged |>
+  count(PW_WAGE_LEVEL, name = "Count")|>
+  arrange(desc(Count))
+```
+
+Selection Rates by Employers
+```{r}
+# Compare LCAs to Approvals by employer
+summary_df <- merged |> 
+  group_by(EMPLOYER_NAME) |> 
+  summarize(
+    num_LCAs = n(),
+    approvals = max(New_Employment_Approval, na.rm = TRUE),
+    approval_rate = approvals / num_LCAs
+  ) |> 
+  arrange(desc(approvals))
+```
+
+```{r}
+# Filter LCA rows to only H-1B + Certified cases
+certified_lca <- merged |> 
+  filter(VISA_CLASS == "H-1B", CASE_STATUS == "Certified")
+
+# Summarize by employer
+certified_lca <- merged |> 
+  filter(VISA_CLASS == "H-1B", CASE_STATUS == "Certified") |> 
+  mutate(
+    # Remove Inc., LLC, L.L.C. etc (case-insensitive, optional comma/space before)
+    EMPLOYER_NAME = str_remove_all(
+      EMPLOYER_NAME,
+      "\\s*,?\\s*(?i)(inc\\.?|llc|l\\.l\\.c\\.)\\b"
+    ),
+    # Remove trailing period (if any)
+    EMPLOYER_NAME = str_remove(EMPLOYER_NAME, "\\.$"),
+    
+    # Remove extra whitespace
+    EMPLOYER_NAME = str_squish(EMPLOYER_NAME),
+
+    # Create a punctuation- and space-free lowercase key for matching
+    EMPLOYER_KEY = EMPLOYER_NAME |> 
+      str_to_lower() |> 
+      str_remove_all("[[:punct:]\\s]")
+  )
+
+certified_lca <- certified_lca |> 
+  mutate(
+    PW_WAGE_LEVEL = factor(PW_WAGE_LEVEL, 
+                           levels = c("I", "II", "III", "IV"), 
+                           ordered = TRUE),
+
+    # Normalize casing and trim whitespace
+    PW_UNIT_OF_PAY = str_trim(str_to_title(PW_UNIT_OF_PAY)),
+
+    # Clean wage values: remove $ and commas
+    PREVAILING_WAGE_CLEAN = str_remove_all(PREVAILING_WAGE, "[$,]"),
+
+    # Convert to numeric, replacing non-numeric strings with NA
+    PREVAILING_WAGE_CLEAN = suppressWarnings(as.numeric(PREVAILING_WAGE_CLEAN)),
+
+    # Annualize wage
+    ANNUALIZED_WAGE = case_when(
+      PW_UNIT_OF_PAY == "Hour" ~ PREVAILING_WAGE_CLEAN * 2080,
+      PW_UNIT_OF_PAY == "Week" ~ PREVAILING_WAGE_CLEAN * 52,
+      PW_UNIT_OF_PAY == "Bi-Weekly" ~ PREVAILING_WAGE_CLEAN * 26,
+      PW_UNIT_OF_PAY == "Month" ~ PREVAILING_WAGE_CLEAN * 12,
+      PW_UNIT_OF_PAY == "Year" ~ PREVAILING_WAGE_CLEAN,
+      TRUE ~ NA_real_
+    )
+  )
+
+certified_summary <- certified_lca |>
+  group_by(EMPLOYER_KEY) |>
+  summarize(
+    EMPLOYER_NAME = EMPLOYER_NAME[1],
+    Certified_LCAs = n(),
+    New_Employment_Approval = max(New_Employment_Approval, na.rm = TRUE),
+    Most_Common_SOC = SOC_TITLE |> na.omit() |> as.character() |> table() |> which.max() |> names(),
+    Median_Prevailing_Wage_Level = levels(PW_WAGE_LEVEL)[median(as.numeric(PW_WAGE_LEVEL), na.rm = TRUE)],
+    Median_Annualized_Prevailing_Wage = median(ANNUALIZED_WAGE, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(New_Employment_Approval))
+
+
+
+#if doing any other merge with certified_lca and another dataset with employer names in the future, 
+#other_df <- other_df |> 
+#  mutate(EMPLOYER_KEY = str_to_lower(EMPLOYER_NAME)) 
+#and merge of EMPLOYER_KEY
+
+write_xlsx(certified_summary, "Certified_H1B_vs_New_Approvals.xlsx")
+```
+
