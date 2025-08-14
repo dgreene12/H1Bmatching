@@ -155,6 +155,6 @@ certified_summary <- certified_lca |>
 #  mutate(EMPLOYER_KEY = str_to_lower(EMPLOYER_NAME)) 
 #and merge of EMPLOYER_KEY
 
-write_xlsx(certified_summary, "Certified_H1B_vs_New_Approvals.xlsx")
+#write_csv(certified_summary, "Certified_H1B_vs_New_Approvals.csv")
 ```
 
